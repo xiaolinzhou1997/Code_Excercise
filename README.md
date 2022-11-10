@@ -8,3 +8,4 @@ Plan:
 - [ ] Rust NXFP Algorithm
 - [ ] CCP Estimator
 - [ ] SO MUCH MORE
+- [ ] Use PyBLP in R Env
