@@ -1,60 +1,72 @@
+### tidyverse for data cleaning/data.table/furrr for future mapping.
 library(tidyverse)
-library(hdm)
 library(data.table)
 library(furrr)
-data(BLP)
-BLP <- BLP$BLP
-BLP$price <- BLP$price + 11.761
-#Test dataset, cross-sectional.
-BLP_test <- filter(BLP, cdid==10)[,7:11] %>%
-  as.matrix()
-BLP_share <- filter(BLP, cdid==10)[,"share"]
-p <- filter(BLP, cdid==10)[,6]
 
-{ #Parameters for testing
-  sigma <- c(1,1,1,1,1)
-  alpha <-  1
-  delta <- runif(nrow(BLP_test),5,10)
+### Get Nevo 2001 data from PyBLP and some housekeeping
+{
+  library(reticulate)
+  use_python("/Library/Frameworks/Python.framework/Versions/3.11/bin/python3")
+  pyblp <- import("pyblp")
+  cereal <- fread(pyblp$data$NEVO_PRODUCTS_LOCATION)
+  demographic <- fread(pyblp$data$NEVO_AGENTS_LOCATION)
+  # add constant
+  cereal <- cereal[,constant:=1] %>%
+    relocate(constant, .before=prices)
+  # add outside shares
+  cereal <- cereal[,out_shares:=1-sum(shares),market_ids] %>%
+    relocate(out_shares, .after=shares)
 }
 
-n <- 1000
-###Draw numbers for each year aka market.
-log.y_draw <- randtoolbox::halton(n, 103, normal = TRUE,start = 20221108)*0.84+3.082
-yp_draw <- sweep(exp(log.y_draw), 2, p) 
-# log.yp <- matrix(rep(rep(log.y_draw), n),nrow=n)
-# May want to use Nevo(2000) method to use y-p to capture price sensitivity. 
-v_draw <- randtoolbox::halton(n, 5, normal = TRUE,start = 19970107)
+demog <- demographic[,c("income", "income_squared", "age", "child")] %>% 
+  as.matrix()
+X1 <- cereal[,c("constant", "prices", "sugar", "mushy")] %>%
+  as.matrix()
+X2 <- cereal[,c("constant", "prices", "sugar", "mushy")] %>%
+  as.matrix()
 
-v_draw <- split(v_draw, seq(nrow(v_draw)))
-yp_draw <- split(yp_draw, seq(nrow(yp_draw)))
-v_draw <- map(v_draw, as.matrix) %>% map(t)
-yp_draw <- map(yp_draw, as.matrix)
 
-cal_eu <- function(yp_draw, v_draw, char, alpha, delta, sigma){
-  u <- delta + rowSums(char %*% sigma %*% v_draw) + alpha * t(yp_draw)
+k <- 4
+N <- 20 #Draws for each market
+J <- cereal[,list("J"=length(product_ids)),market_ids]
+
+T <- nrow(J)
+
+{ #Parameters for testing
+  sigma <- c(0.377,1.848,0.004,0.081)
+  alpha <-  -4
+  delta <- log(cereal[,shares])-log(cereal[,out_shares])
+}
+
+v_draw <- randtoolbox::halton(n*T, k, normal = TRUE,start = 19970107)
+pi <- c(3.09, 0, 1.186, 0, 16.6, -0.66, 0, 11.6,
+        -0.193, 0, 0.03, 0, 1.468, 0, -1.5, 0)
+
+cal_eu <- function(X2, DEMO, V, delta, sigma, pi, T, N){
+  u <- matrix(nrow = T*24,ncol = N)
+ for (t in 1:T) {
+   for (n in 1:N) {
+     for (j in 1:24) {
+       u[(t-1)*24+j,n] <- delta[(t-1)*24+j] + sum(X2[(t-1)*24+j,] * V[(t-1)*20 + n,] * sigma) + 
+         sum(rep(X2[(t-1)*24+j,],4) * rep(demog[(t-1)*20 + n,]) * pi)
+     }
+   }
+ }
   eu <- u %>% exp()
     return(eu)
 }
 
 
+share <- 1e10
 
-cal_share <- function(delta. = delta, ## J vector = mean utility
-                     data,      ## J by K = from data where K = K characteristics
-                     income,      ## S vector = income draw
-                     yp,     ## S by J Matrix
-                     v,      ## S by K = Var of K characteristics
-                     p.=p,      ## J vector
-                     alpha. = alpha,  ## scalar = coefficient of log.yp
-                     sigma. = sigma)  ## K vector
+cal_share <- function(X2, demog, v_draw, delta, sigma, pi, T, N)  ## K vector
 {
-  numer <- map2(yp, v, cal_eu, data, alpha., delta., sigma.)
-  denom <- numer %>%
-    map(sum) %>% 
-    map(~ . + 1)
-  share <- map2(numer, denom, ~ .x/.y) %>%
-    map(as.data.table) %>%
-    rbindlist() %>%
-    colMeans()
+  utility <- cal_eu(X2, demog, v_draw, delta, sigma, pi, T, N)
+  for (t in 1:T) {
+    numer <- utility[(1+24*(t-1)):(24*t),] 
+    denom <- 1 + colSums(utility[(1+24*(t-1)):(24*t),])
+    share[(1+24*(t-1)):(24*t)] <- (t(numer)/denom) %>% colMeans()
+  }
   return(share)
 }
 
@@ -66,11 +78,11 @@ cal_share <- function(delta. = delta, ## J vector = mean utility
 inner_loop <- function(delta, true_share, max_iter = 1000, tol = 10e-14){
   iter <- 0
   for (iter in iter:max_iter) {
-    share <- cal_share(delta, BLP_test, yp=yp_draw, v=v_draw, p=p, alpha=alpha, sigma=sigma)
+    share <- cal_share(X2, demog, v_draw, delta, sigma, pi, T, N)
     #share <- share + runif(nrow(BLP_test),10e-5,10e-3)
     n_delta <- delta + log(true_share)- log(share)
     delta <- n_delta
-    d <- mean(abs(true_share-share))
+    d <- max(abs(true_share-share))
     if (d < tol){
       cat(paste("converged at", iter), fill=TRUE)
       break}
@@ -85,6 +97,6 @@ inner_loop <- function(delta, true_share, max_iter = 1000, tol = 10e-14){
 }
 
 
-profvis(delta_new <- inner_loop(delta, BLP_share))
+profvis(delta_new <- inner_loop(delta, cereal$shares))
 
 
